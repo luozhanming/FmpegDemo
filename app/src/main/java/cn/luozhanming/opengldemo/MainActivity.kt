@@ -33,7 +33,7 @@ class MainActivity : AppCompatActivity() {
             val outputStr = "${Environment.getExternalStorageDirectory().absoluteFile}/${output.text.toString()}"
             object :Thread(){
                 override fun run() {
-                    test.decode("http://vfx.mtime.cn/Video/2019/03/21/mp4/190321153853126488.mp4",outputStr)
+                    test.decode(inputStr,outputStr)
                 }
             }.start()
         }

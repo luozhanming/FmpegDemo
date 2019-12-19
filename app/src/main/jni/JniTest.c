@@ -3,6 +3,7 @@
 //
 
 #include <libavutil/imgutils.h>
+#include <pthread.h>
 #include "cn_luozhanming_opengldemo_JniTest.h""
 #include "libavcodec/avcodec.h"
 #include "mlog.h"
@@ -10,21 +11,116 @@
 #include "libswscale/swscale.h"
 
 
-typedef struct Global {
-    uint8_t i;
-    uint8_t j;
-};
+typedef struct {
+    const char *input;
+    const char *output;
+    AVFormatContext *pFormatCtx;
+    AVCodecContext *pCodecCtx;
+    AVCodec *pCodec;
+    int video_stream_num;
+    int *video_stream_index;
+    int audio_stream_num;
+    int *audio_stream_index;
+    int isDecoding;
+    pthread_t decode_send_thread;
+    pthread_t decode_receive_thread;
+} FFmpegGlobal;
+
+
+FFmpegGlobal *mGlobal;
 
 
 //Output FFmpeg's av_log()
-void custom_log(void *ptr, int level, const char* fmt, va_list vl){
-    FILE *fp=fopen("/storage/emulated/0/av_log.txt","a+");
-    if(fp){
-        vfprintf(fp,fmt,vl);
+void custom_log(void *ptr, int level, const char *fmt, va_list vl) {
+    FILE *fp = fopen("/storage/emulated/0/av_log.txt", "a+");
+    if (fp) {
+        vfprintf(fp, fmt, vl);
         fflush(fp);
         fclose(fp);
     }
 }
+
+static void pgm_save(unsigned char *buf, int wrap, int xsize, int ysize,
+                     const char *filename)
+{
+    FILE *f;
+    int i;
+    f = fopen(filename,"w");
+    fprintf(f, "P5\n%d %d\n%d\n", xsize, ysize, 255);
+    for (i = 0; i < ysize; i++)
+        fwrite(buf + i * wrap, 1, xsize, f);
+    fclose(f);
+}
+
+/**
+ * 送解线程
+ * */
+void send_decode_data(void *ptr) {
+    int ret = -1;
+    FILE *output_file = fopen(mGlobal->output,"wb+");
+    char buf[1024] = {};
+    AVPacket *packet;
+    packet = av_packet_alloc();
+    if (!packet) {
+        LOGE("Could not alloc packet.");
+        return;
+    }
+    AVFrame *frame;
+    frame = av_frame_alloc();
+    if (!frame) {
+        LOGE("Could not alloc frame.");
+        return;
+    }
+    int frame_count = 0;
+    int isEnd = 0;
+    while (mGlobal->isDecoding && isEnd == 0) {
+        ret = av_read_frame(mGlobal->pFormatCtx, packet);
+        if (ret >= 0) {
+            //视频
+            if (packet->stream_index == *mGlobal->video_stream_index) {
+                LOGE("Read packet %d,Packet data size %d,Packet stream index %d", frame_count,
+                     packet->size, packet->stream_index);
+                frame_count++;
+                if (avcodec_send_packet(mGlobal->pCodecCtx, packet) == 0) {
+                    LOGE("视频送解码成功");
+                }
+            }
+        } else {
+            LOGE("读到结尾了");
+            isEnd = 1;
+        }
+
+        ret = avcodec_receive_frame(mGlobal->pCodecCtx, frame);
+        if (ret == 0) {
+            LOGE("Frame data size %d,Frame format %d,Frame width %d,isKeyFrame:%d,AVPictureType %d,linesize %d,pkg_pts:%llu,pts %llu,dts:%llu",
+                 frame->pkt_size, frame->format, frame->width, frame->key_frame, frame->pict_type,
+                 frame->linesize[0],frame->pkt_pts,frame->pts,frame->pkt_dts);
+            size_t y_size = mGlobal->pCodecCtx->width*mGlobal->pCodecCtx->height;
+            fwrite(frame->data[0],1,y_size,output_file);    //Y
+            fwrite(frame->data[1],1,y_size/4,output_file);  //U
+            fwrite(frame->data[2],1,y_size/4,output_file);  //V
+
+        }
+    }
+    //flush decode
+    ret = avcodec_send_packet(mGlobal->pCodecCtx, NULL);
+    while (ret >= 0) {
+        ret = avcodec_receive_frame(mGlobal->pCodecCtx, frame);
+        if (ret == 0) {
+            LOGE("Frame data size %d,Frame format %d,Frame width %d,isKeyFrame:%d,AVPictureType %d,linesize %d,pkg_pts:%llu,pts %llu,dts:%llu",
+                 frame->pkt_size, frame->format, frame->width, frame->key_frame, frame->pict_type,
+                 frame->linesize[0],frame->pkt_pts,frame->pts,frame->pkt_dts);
+            size_t y_size = mGlobal->pCodecCtx->width*mGlobal->pCodecCtx->height;
+            fwrite(frame->data[0],1,y_size,output_file);    //Y
+            fwrite(frame->data[1],1,y_size/4,output_file);  //U
+            fwrite(frame->data[2],1,y_size/4,output_file);  //V
+        }
+    }
+    fclose(output_file);
+    av_packet_free(packet);
+    av_frame_free(frame);
+}
+
 
 
 JNIEXPORT jstring JNICALL Java_cn_luozhanming_opengldemo_FFmpgeTest_jniString(
@@ -32,172 +128,99 @@ JNIEXPORT jstring JNICALL Java_cn_luozhanming_opengldemo_FFmpgeTest_jniString(
         jobject obj) {
     char *info;
     info = (char *) malloc(10000 * sizeof(char));
-    if(!info){
-        return (*env)->NewStringUTF(env,"No space at all.");
+    if (!info) {
+        return (*env)->NewStringUTF(env, "No space at all.");
     }
-    sprintf(info,"%s\n",avcodec_configuration());
+    sprintf(info, "%s\n", avcodec_configuration());
     return (*env)->NewStringUTF(env, info);
 }
 
-JNIEXPORT jint JNICALL Java_cn_luozhanming_opengldemo_FFmpgeTest_decode(
+
+/**
+ * 将输入媒体流转化为其他格式
+ * */
+jint JNICALL Java_cn_luozhanming_opengldemo_FFmpgeTest_decode(
         JNIEnv *env,
         jobject obj,
         jstring input_jstr,
-        jstring output_jstr){
-    AVFormatContext *pFormatCtx;
-    int i,videoindex;
-    AVCodecContext *pCodecCtx;
-    AVCodec *pCodec;
-    AVFrame *pFrame,*pFrameYUV;
-    uint8_t *out_buffer;
-    AVPacket *packet;
-    int y_size;
-    int ret,got_picture;
-    struct SwsContext *img_convert_ctx;
-    FILE *fp_yuv;
-    int frame_cnt;
-    clock_t time_start,time_finish;
-    double  time_duration = 0.0;
-
-    char input_str[500]={0};
-    char output_str[500]={0};
-    char info[1000]={0};
-    sprintf(input_str,"%s",(*env)->GetStringUTFChars(env,input_jstr, NULL));
-    sprintf(output_str,"%s",(*env)->GetStringUTFChars(env,output_jstr, NULL));
-
+        jstring output_jstr) {
+    /*1.解协议*/
+    mGlobal = (FFmpegGlobal *) malloc(sizeof(FFmpegGlobal));
+    mGlobal->input = (*env)->GetStringUTFChars(env, input_jstr, NULL);
+    mGlobal->output = (*env)->GetStringUTFChars(env, output_jstr, NULL);
+    //初始化ffmpeg
     av_log_set_callback(custom_log);
     av_register_all();
     avformat_network_init();
-    pFormatCtx = avformat_alloc_context();
+//    //分配空间
+    mGlobal->pFormatCtx = avformat_alloc_context();
+    if (!mGlobal->pFormatCtx) {
+        LOGE("Could not alloc AVFormatContext.");
+        return -1;
+    }
+    //打开输入流
+    if (avformat_open_input(&(mGlobal->pFormatCtx),  mGlobal->input, NULL, NULL) != 0) {
+        LOGE("Could not open %s",  mGlobal->input);
+        return -1;
+    }
+    if (avformat_find_stream_info(mGlobal->pFormatCtx, NULL) < 0) {
+        LOGE("Couldn't find stream information.");
+        return -1;
+    }
 
-    if(avformat_open_input(&pFormatCtx,input_str,NULL,NULL)!=0){
-        LOGE("Couldn't open input stream.\n");
-        return -1;
-    }
-    if(avformat_find_stream_info(pFormatCtx,NULL)<0){
-        LOGE("Couldn't find stream information.\n");
-        return -1;
-    }
-    videoindex=-1;
-    for(i=0; i<pFormatCtx->nb_streams; i++)
-        if(pFormatCtx->streams[i]->codec->codec_type==AVMEDIA_TYPE_VIDEO){
-            videoindex=i;
-            break;
+    /*2.视频解码*/
+    //分配音视频Stream类型
+    mGlobal->audio_stream_index = (int *) malloc(sizeof(int) * 10);
+    mGlobal->video_stream_index = (int *) malloc(sizeof(int) * 10);
+    mGlobal->video_stream_num = 0;
+    mGlobal->audio_stream_num = 0;
+    for (int i = 0; i < mGlobal->pFormatCtx->nb_streams; ++i) {
+        if (mGlobal->pFormatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            *(mGlobal->video_stream_index + mGlobal->video_stream_num * sizeof(int)) = i;
+            LOGE("Video stream index %d",
+                 *(mGlobal->video_stream_index + mGlobal->video_stream_num * sizeof(int)));
+            mGlobal->video_stream_num++;
+            LOGE("Video stream num %d", mGlobal->video_stream_num);
+        } else if (mGlobal->pFormatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            *(mGlobal->audio_stream_index + mGlobal->audio_stream_num * sizeof(int)) = i;
+            LOGE("Audio stream index %d",
+                 *(mGlobal->audio_stream_index + mGlobal->audio_stream_num * sizeof(int)));
+            mGlobal->audio_stream_num++;
+            LOGE("Audio stream num %d", mGlobal->audio_stream_num);
         }
-    if(videoindex==-1){
-        LOGE("Couldn't find a video stream.\n");
+    }
+
+    AVDictionary *opts = NULL;
+    mGlobal->pCodec = avcodec_find_decoder(
+            mGlobal->pFormatCtx->streams[*mGlobal->video_stream_index]->codecpar->codec_id);
+    if (!mGlobal->pCodec) {
+        LOGE("Couldn't find video decoder.");
         return -1;
     }
-    pCodecCtx=pFormatCtx->streams[videoindex]->codec;
-    pCodec=avcodec_find_decoder(pCodecCtx->codec_id);
-    if(pCodec==NULL){
-        LOGE("Couldn't find Codec.\n");
+    av_dump_format(mGlobal->pFormatCtx, 0,  mGlobal->input, 0);
+    //为解码器分配上下文空间
+    mGlobal->pCodecCtx = avcodec_alloc_context3(mGlobal->pCodec);
+//    // 将AVStream里面的参数复制到上下文当中
+    avcodec_parameters_to_context(mGlobal->pCodecCtx,
+                                  mGlobal->pFormatCtx->streams[*mGlobal->video_stream_index]->codecpar);
+    mGlobal->pCodecCtx->thread_count = 8;
+
+    if (avcodec_open2(mGlobal->pCodecCtx, mGlobal->pCodec, &opts) != 0) {
+        LOGE("Couldn't open video decoder.");
         return -1;
     }
-    if(avcodec_open2(pCodecCtx, pCodec,NULL)<0){
-        LOGE("Couldn't open codec.\n");
-        return -1;
+    mGlobal->isDecoding = 1;
+    if (pthread_create(&mGlobal->decode_send_thread, NULL, (void *) &send_decode_data,
+                       (void *) "send") ==
+        0) {
+        LOGE("送解线程创建成功");
     }
 
-    pFrame=av_frame_alloc();
-    pFrameYUV=av_frame_alloc();
-    out_buffer=(unsigned char *)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_YUV420P,  pCodecCtx->width, pCodecCtx->height,1));
-    av_image_fill_arrays(pFrameYUV->data, pFrameYUV->linesize,out_buffer,
-                         AV_PIX_FMT_YUV420P,pCodecCtx->width, pCodecCtx->height,1);
-
-
-    packet=(AVPacket *)av_malloc(sizeof(AVPacket));
-
-    img_convert_ctx = sws_getContext(pCodecCtx->width, pCodecCtx->height, pCodecCtx->pix_fmt,
-                                     pCodecCtx->width, pCodecCtx->height, AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL);
-
-
-    sprintf(info,   "[Input     ]%s\n", input_str);
-    sprintf(info, "%s[Output    ]%s\n",info,output_str);
-    sprintf(info, "%s[Format    ]%s\n",info, pFormatCtx->iformat->name);
-    sprintf(info, "%s[Codec     ]%s\n",info, pCodecCtx->codec->name);
-    sprintf(info, "%s[Resolution]%dx%d\n",info, pCodecCtx->width,pCodecCtx->height);
-
-
-    fp_yuv=fopen(output_str,"wb+");
-    if(fp_yuv==NULL){
-        printf("Cannot open output file.\n");
-        return -1;
-    }
-
-    frame_cnt=0;
-    time_start = clock();
-
-    while(av_read_frame(pFormatCtx, packet)>=0){
-        if(packet->stream_index==videoindex){
-            ret = avcodec_decode_video2(pCodecCtx, pFrame, &got_picture, packet);
-            if(ret < 0){
-                LOGE("Decode Error.\n");
-                return -1;
-            }
-            if(got_picture){
-                sws_scale(img_convert_ctx, (const uint8_t* const*)pFrame->data, pFrame->linesize, 0, pCodecCtx->height,
-                          pFrameYUV->data, pFrameYUV->linesize);
-
-                y_size=pCodecCtx->width*pCodecCtx->height;
-                fwrite(pFrameYUV->data[0],1,y_size,fp_yuv);    //Y
-                fwrite(pFrameYUV->data[1],1,y_size/4,fp_yuv);  //U
-                fwrite(pFrameYUV->data[2],1,y_size/4,fp_yuv);  //V
-                //Output info
-                char pictype_str[10]={0};
-                switch(pFrame->pict_type){
-                    case AV_PICTURE_TYPE_I:sprintf(pictype_str,"I");break;
-                    case AV_PICTURE_TYPE_P:sprintf(pictype_str,"P");break;
-                    case AV_PICTURE_TYPE_B:sprintf(pictype_str,"B");break;
-                    default:sprintf(pictype_str,"Other");break;
-                }
-                LOGI("Frame Index: %5d. Type:%s",frame_cnt,pictype_str);
-                frame_cnt++;
-            }
-        }
-        av_packet_unref(packet);
-    }
-    //flush decoder
-    //FIX: Flush Frames remained in Codec
-    while (1) {
-        ret = avcodec_decode_video2(pCodecCtx, pFrame, &got_picture, packet);
-        if (ret < 0)
-            break;
-        if (!got_picture)
-            break;
-        sws_scale(img_convert_ctx, (const uint8_t* const*)pFrame->data, pFrame->linesize, 0, pCodecCtx->height,
-                  pFrameYUV->data, pFrameYUV->linesize);
-        int y_size=pCodecCtx->width*pCodecCtx->height;
-        fwrite(pFrameYUV->data[0],1,y_size,fp_yuv);    //Y
-        fwrite(pFrameYUV->data[1],1,y_size/4,fp_yuv);  //U
-        fwrite(pFrameYUV->data[2],1,y_size/4,fp_yuv);  //V
-        //Output info
-        char pictype_str[10]={0};
-        switch(pFrame->pict_type){
-            case AV_PICTURE_TYPE_I:sprintf(pictype_str,"I");break;
-            case AV_PICTURE_TYPE_P:sprintf(pictype_str,"P");break;
-            case AV_PICTURE_TYPE_B:sprintf(pictype_str,"B");break;
-            default:sprintf(pictype_str,"Other");break;
-        }
-        LOGI("Frame Index: %5d. Type:%s",frame_cnt,pictype_str);
-        frame_cnt++;
-    }
-    time_finish = clock();
-    time_duration=(double)(time_finish - time_start);
-
-    sprintf(info, "%s[Time      ]%fms\n",info,time_duration);
-    sprintf(info, "%s[Count     ]%d\n",info,frame_cnt);
-
-    sws_freeContext(img_convert_ctx);
-
-    fclose(fp_yuv);
-
-    av_frame_free(&pFrameYUV);
-    av_frame_free(&pFrame);
-    avcodec_close(pCodecCtx);
-    avformat_close_input(&pFormatCtx);
-
+    // decode();
     return 0;
 
 }
+
+
+
 
